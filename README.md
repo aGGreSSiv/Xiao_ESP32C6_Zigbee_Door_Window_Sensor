@@ -1,5 +1,10 @@
 # DIY Zigbee Door/Window Sensor (ESP32-C6)
 
+![Platform](https://img.shields.io/badge/Platform-Zigbee-blue?style=flat)
+![Hardware](https://img.shields.io/badge/Hardware-ESP32--C6-green?style=flat)
+![Device](https://img.shields.io/badge/Device-Contact_Sensor-orange?style=flat)
+![Buy_Now](https://img.shields.io/badge/Buy_Parts-AliExpress-red?style=flat)
+
 ![Banner Image](Images/IMG_20260313_191940.jpg) <!-- Optional banner image to showcase the build -->
 
 A low-power, deeply customizable Zigbee Contact Sensor built using the ESP32-C6 microcontroller. This project integrates seamlessly with Home Assistant via Zigbee2MQTT (Z2M) or ZHA, reporting instantaneous open/close states alongside accurate battery percentage through periodic deep sleep wakeups.

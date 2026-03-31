@@ -15,12 +15,16 @@
 #define LED_BUILTIN_PIN LED_BUILTIN // Onboard yellow LED
 
 // --- Timing and Thresholds ---
-#define uS_TO_S_FACTOR 1000000ULL /* Conversion factor for micro seconds to seconds */
+#define uS_TO_S_FACTOR                                                         \
+  1000000ULL /* Conversion factor for micro seconds to seconds */
 // Wake up periodically to report battery, e.g., every 1 hour (3600 seconds)
 #define TIME_TO_SLEEP 3600
 
 // --- RTC Variables (Retained during deep sleep) ---
-RTC_DATA_ATTR uint32_t rtc_time_until_report = TIME_TO_SLEEP;
+RTC_DATA_ATTR uint32_t rtc_ext1_wake_count = 0;
+// Counts 1-hour timer wakeups since last battery report. Resets after BATTERY_REPORT_EVERY_N_HOURS.
+RTC_DATA_ATTR uint8_t timer_wakeup_count = 0;
+#define BATTERY_REPORT_EVERY_N_HOURS 24
 
 // --- Zigbee Variables ---
 #define CONTACT_SENSOR_ENDPOINT 10
@@ -56,7 +60,11 @@ void reportBattery() {
   }
 
   // ADC Calibration Factor: Adjust this to match your multimeter reading.
-  float calibration_factor = 1.0145;
+  // User measured 4.19V with multimeter, Serial monitor showed 4.25V originally
+  // (with 1.0145 factor). Without factor, raw was: 4.25 / 1.0145 = 4.1892V New
+  // ideal factor = 4.19 / 4.1892 = 1.00019 (Basically 1.0) Let's set it
+  // precisely to match the 4.19V target.
+  float calibration_factor = 1.0002;
   // Factor of 2.0 handles the 1MOhm/1MOhm voltage divider (half voltage at A0)
   float Vbattf = (2.0 * Vbatt / 16.0 / 1000.0) * calibration_factor;
 
@@ -73,7 +81,8 @@ void reportBattery() {
   zbContactSensor.setBatteryVoltage(
       (uint8_t)(Vbattf * 10.0)); // e.g., 41 for 4.1V
   zbContactSensor.setBatteryPercentage(
-      (uint8_t)(percentageReal * 2)); // Zigbee percentage is 1 unit = 0.5%
+      (uint8_t)percentageReal); // Zigbee percentage is 1 unit = 0.5% (adjusted
+                                // implicitly)
 
   // Force update to Home Assistant
   zbContactSensor.reportBatteryPercentage();
@@ -106,28 +115,18 @@ void setup() {
   }
 
   // Calculate how long we were asleep based on the wake-up reason
-  uint32_t sleep_duration_s = 0;
-  if (global_wakeup_reason == ESP_SLEEP_WAKEUP_EXT1) {
-    // If we woke up before the timer, figure out roughly how much we slept.
-    // esp_sleep_get_time_since_wakeup() doesn't give time spent in sleep.
-    // There isn't a direct way to get "time spent sleeping" accurately without
-    // reading an RTC clock, but we can do a simplified approximation or just
-    // decrement a fixed amount for simplicity. Let's use a robust approach:
-    // Every time we wake up for GPIO, we assume we were asleep for the full
-    // elapsed time since we went to sleep. Or we can just read the RTC time.
-    // 
-    // Wait, let's keep it simple: instead of tracking exact microseconds, we just
-    // schedule the *next* wake up timer to the remaining time.
-    // For ESP32, wake up from timer resets the internal RTC timer.
-    // To measure time properly across sleeps, we could use system time + SNTP,
-    // but we don't have WiFi/SNTP.
-  }
-  
   if (global_wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-    // Timer expired! Time to report. Reset the counter.
-    rtc_time_until_report = TIME_TO_SLEEP;
+    // Timer wakeup: increment toward next battery report
+    timer_wakeup_count++;
+    Serial.printf("Timer wakeup #%d / %d until next battery report\n",
+                  timer_wakeup_count, BATTERY_REPORT_EVERY_N_HOURS);
+    rtc_ext1_wake_count = 0;
+  } else if (global_wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    // First boot: report battery immediately, reset counter
+    timer_wakeup_count = BATTERY_REPORT_EVERY_N_HOURS; // triggers report below
+    rtc_ext1_wake_count = 0;
   }
-  
+
   // Update last activity time
   wakeTime = millis();
   lastActivityTime = millis();
@@ -144,7 +143,7 @@ void setup() {
   gpio_hold_dis((gpio_num_t)REED_SWITCH_PIN);
 
   // --- Zigbee Setup ---
-  zbContactSensor.setManufacturerAndModel("Espressif", "ZBSensor2");
+  zbContactSensor.setManufacturerAndModel("Espressif", "DoorSensor");
 
   // Set power source to battery
   zbContactSensor.setPowerSource(ZB_POWER_SOURCE_BATTERY, 100, 33);
@@ -219,11 +218,17 @@ void setup() {
     // Blink LED to indicate we connected and sent state
     triggerLED(LED_BUILTIN_PIN);
 
-    // Sadece Timer ile uyandığında veya cihaza ilk güç verildiğinde (UNDEFINED) bataryayı raporla
-    if (global_wakeup_reason == ESP_SLEEP_WAKEUP_TIMER || global_wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
-      Serial.println("Timer or First Boot Wakeup: Reporting Battery & Heartbeat");
+    // Report battery only once per day (every BATTERY_REPORT_EVERY_N_HOURS timer wakeups).
+    // EXT1 (door) wakeups do NOT trigger a battery report to save power.
+    if (timer_wakeup_count >= BATTERY_REPORT_EVERY_N_HOURS) {
+      Serial.println("Reporting Battery (daily heartbeat)...");
       reportBattery();
+      timer_wakeup_count = 0;
+    } else {
+      Serial.printf("Skipping battery report (timer count: %d / %d)\n",
+                    timer_wakeup_count, BATTERY_REPORT_EVERY_N_HOURS);
     }
+    rtc_ext1_wake_count = 0;
 
     // --- PAIRING INTERVIEW DELAY ---
     // If the device woke up from a normal boot (not deep sleep), it might be
@@ -251,40 +256,16 @@ void setup() {
   }
 
   // --- Configure Deep Sleep ---
-  
-  // esp_timer_get_time() gives time in microseconds since boot. 
-  // However, in deep sleep it resets? Actually, on ESP32-C6, we can use 
-  // the RTC timer which is preserved.
-  // A simpler and very reliable approach across deep sleep is simply:
-  // "How long were we asleep just now?" -> esp_timer_get_time() is NOT preserved.
-  // But esp_sleep_get_ext1_wakeup_status() doesn't give time.
-  // Wait, `esp_sleep_get_time_since_wakeup()` exists? No.
-  
-  // Let's use gettimeofday() which is preserved across deep sleep on ESP32 if SNTP is not used
-  // (it just counts up using the RTC timer).
-  struct timeval now;
-  gettimeofday(&now, NULL);
-  
-  if (global_wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED) {
-      // First boot
-      rtc_time_until_report = now.tv_sec + TIME_TO_SLEEP;
-  } else if (global_wakeup_reason == ESP_SLEEP_WAKEUP_TIMER) {
-      // Woke up from timer, calculate next report time
-      rtc_time_until_report = now.tv_sec + TIME_TO_SLEEP;
-  }
-  
-  // Calculate remaining time
-  uint64_t remaining_sleep_us = 0;
-  if (rtc_time_until_report > now.tv_sec) {
-      remaining_sleep_us = (uint64_t)(rtc_time_until_report - now.tv_sec) * uS_TO_S_FACTOR;
-  } else {
-      // We somehow missed the time, schedule an immediate report on next sleep
-      remaining_sleep_us = 1000000ULL; // 1 second
-  }
-  
-  // Enable timer wakeup for the REMAINING time
+
+  // We use a fixed fallback timer. If the door isn't opened for 1 hour, this
+  // timer will wake the device up and guarantee a battery heartbeat is sent. We
+  // avoid calculate absolute time across sleep because Zigbee syncs clock to
+  // Epoch, causing huge unexpected jumps that lead to years of sleep!
+  uint64_t remaining_sleep_us = (uint64_t)TIME_TO_SLEEP * uS_TO_S_FACTOR;
   esp_sleep_enable_timer_wakeup(remaining_sleep_us);
-  Serial.printf("Next battery report in %llu seconds\n", remaining_sleep_us / uS_TO_S_FACTOR);
+
+  Serial.printf("Next pure timer battery report in %d seconds\n",
+                TIME_TO_SLEEP);
 
   // Also keep RTC pins enabled during sleep
   esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
